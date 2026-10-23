@@ -19,6 +19,7 @@
 //  LED config
 #define LED_GPIO_BLINK 27 //25
 #define LED_GPIO_2 25
+
 //  handle config
 #define MAX_CONVERSION_FRAME_SIZE 256
 #define MAX_POOL_SIZE 1024
@@ -36,9 +37,10 @@
 #define ADC_BIT_WIDTH       SOC_ADC_DIGI_MAX_BITWIDTH
 
 //
-#define DELAY_MS 2000
+#define DELAY_MS 1000
 #define THR_BASE_UP 100
-#define HYSTERESIS_VAL 500
+#define HYSTERESIS_VAL 200
+#define BASELINE_SAMPLE_COUNT 100
 
 #if defined(__DBG__) || defined(__DBG_UART__)
     #define SAMPLES_COLLECTED 1000
@@ -151,7 +153,7 @@ void app_main(void)
     if (xTaskCreate(ledFlicker_task, "led", 2048, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE("LED", "Nie udalo sie utworzyc taska LED");
     } 
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(DELAY_MS));
     esp_log_level_set("*", ESP_LOG_NONE);
     //  Setup handle for ADC Continuous mode
     //  conv_frame_size and max_store buf_size are default values
@@ -175,17 +177,19 @@ void app_main(void)
 
     //  Set threshold baseline by acquiring 50 raw_data reads and computing the mean
     int baseline = 0;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < BASELINE_SAMPLE_COUNT; i++) {
         int raw;
         ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, ADC_CHANNEL, &raw));
         baseline += raw;
     }
-    baseline /= 50;
+    baseline /= BASELINE_SAMPLE_COUNT;
 
-    //  final threshold
-    int thr = baseline + THR_BASE_UP;
+    //  final thresholds, hysteresis value added to thrLow found experimentally
+    int thrUpp = baseline + HYSTERESIS_VAL;
+    int thrLow = baseline + (HYSTERESIS_VAL * 0.7);
 #ifdef __DBG__
-    printf("THRESHOLD: %d\n", thr);
+    printf("UPPER THRESHOLD: %d\n", thrUpp);
+    printf("LOWER THRESHOLD: %d\n", thrLow);
 #endif
     vTaskDelay(pdMS_TO_TICKS(DELAY_MS));
 
@@ -194,16 +198,25 @@ void app_main(void)
     //  it cannot be 0 nor 1 because they represent actual values while 3 is
     //  easily distinguishable from other read values
     memset(featuresV, 0x03, SAMPLES_COLLECTED);
+
+    // current state assuming the sensor starts from being unobscured
+    int current_state = 0;
     for (int i = 0; i < SAMPLES_COLLECTED; i++) {
         int raw;
         ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, ADC_CHANNEL, &raw));
 
 #ifdef __DBG__
-        printf("Raw data: %-4u, Value: %d  \n\033[A", raw, raw > thr);
+        printf("Raw data: %-4u, Current State: %d  \n\033[A", raw, current_state);
         fflush(stdout);
 #endif
-        
-        featuresV[i] = raw > thr;
+
+        if (raw >= thrUpp) {
+            current_state = 1;
+        } else if (raw <= thrLow) { 
+            current_state = 0;
+        }
+
+        featuresV[i] = (uint8_t)current_state;
         vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 

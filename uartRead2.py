@@ -9,7 +9,7 @@ print('Połączono z', ser.name)
 
 START = b'\xAA'
 END = b'\xBB'
-SAMPLES_TO_COLLECT = 4
+SAMPLES_TO_COLLECT = 1
 
 collected_data = []
 
