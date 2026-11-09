@@ -12,6 +12,7 @@
 #include "hal/adc_types.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_system.h"
 
 // #define __DBG__
 // #define __DBG_UART__
@@ -80,7 +81,7 @@ void ledFlicker_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(500));
         
         gpio_set_level(LED_GPIO_BLINK, 0); // Włącz
-        vTaskDelay(pdMS_TO_TICKS(300));
+        vTaskDelay(pdMS_TO_TICKS(500));
         
         gpio_set_level(LED_GPIO_BLINK, 1); // Wyłącz
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -89,7 +90,7 @@ void ledFlicker_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(500));
         
         gpio_set_level(LED_GPIO_BLINK, 1); // Wyłącz
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -142,7 +143,9 @@ for(int i = 0; i < SAMPLES_COLLECTED; i++) {
 #else
     (void)retSum;
 #endif
-
+    ESP_ERROR_CHECK(uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(1000)));
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
     vTaskDelete(NULL);
 }
 
