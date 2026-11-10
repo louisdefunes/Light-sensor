@@ -9,6 +9,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM, SVC
 
+import joblib
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATASETS = (
@@ -185,6 +186,16 @@ def main() -> None:
             test_size=TEST_SIZE,
             random_state=RANDOM_STATE,
         )
+    X, y = load_dataset(SCRIPT_DIR / "dataset.csv", "surowy")
+
+    model = make_pipeline(
+        SimpleImputer(strategy="median"),
+        StandardScaler(),
+        SVC(class_weight="balanced")
+    )
+
+    model.fit(X, y)
+    joblib.dump(model, SCRIPT_DIR / "model.joblib")
 
 
 if __name__ == "__main__":
