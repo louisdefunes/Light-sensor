@@ -1,133 +1,136 @@
 import argparse
 import csv
+from collections import defaultdict
 from pathlib import Path
-
-from featureExtraction import extract_features
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR = SCRIPT_DIR.parent
-SAMPLE_PREFIX = "pomiary_testowe"
-SAMPLE_PERIOD_MS = 10.0
+DEFAULT_INPUT = SCRIPT_DIR.parent / "pomiary_testowe.csv"
+DEFAULT_OUTPUT = SCRIPT_DIR / "dataset.csv"
+SAMPLE_COUNT = 1000
 
 
-def load_recordings() -> list[tuple[int, list[int]]]:
-    files = sorted(
-        path
-        for path in DATA_DIR.glob(f"{SAMPLE_PREFIX}*.csv")
-        if path.stem.upper() != SAMPLE_PREFIX.upper()
-    )
-    if not files:
-        raise FileNotFoundError(f"Nie znaleziono plików pomiarowych w {DATA_DIR}")
+def load_recordings(path: Path) -> list[tuple[list[int], list[int]]]:
+    recordings: dict[int, dict[int, tuple[int, int]]] = defaultdict(dict)
 
-    recordings = []
-    invalid_count = 0
-    expected_sample_count = None
-    for path in files:
-        person = path.stem[len(SAMPLE_PREFIX) :].strip("_").upper()
-        if not person:
-            raise ValueError(f"Nie można ustalić osoby z nazwy pliku {path.name}.")
-        label = int(person == "IGOR")
+    with path.open("r", newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
+        expected_columns = {
+            "measurement",
+            "sample_index",
+            "user_signal",
+            "reference_signal",
+        }
+        if not reader.fieldnames or not expected_columns.issubset(reader.fieldnames):
+            raise ValueError(
+                f"{path} musi zawierać kolumny: "
+                f"{', '.join(sorted(expected_columns))}."
+            )
 
-        with path.open("r", newline="", encoding="utf-8-sig") as source:
-            for line_number, row in enumerate(csv.reader(source), start=1):
-                if not row or all(not value.strip() for value in row):
-                    continue
-                try:
-                    sample = [int(value.strip()) for value in row]
-                except ValueError as error:
-                    raise ValueError(
-                        f"{path.name}, wiersz {line_number}: "
-                        "oczekiwano próbek całkowitych."
-                    ) from error
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                measurement = int(row["measurement"])
+                sample_index = int(row["sample_index"])
+                user_value = int(row["user_signal"])
+                reference_value = int(row["reference_signal"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{path}, wiersz {line_number}: "
+                    "nieprawidłowa wartość pomiaru lub sygnału."
+                ) from error
 
-                if any(value not in (0, 1) for value in sample):
-                    raise ValueError(
-                        f"{path.name}, wiersz {line_number}: "
-                        "próbka zawiera wartość inną niż 0 lub 1."
-                    )
-                if all(value == sample[0] for value in sample):
-                    print(
-                        f"Pominięto nieprawidłową próbkę bez zmian stanu: "
-                        f"{path.name}, wiersz {line_number}."
-                    )
-                    invalid_count += 1
-                    continue
-                if expected_sample_count is None:
-                    expected_sample_count = len(sample)
-                elif len(sample) != expected_sample_count:
-                    raise ValueError(
-                        f"{path.name}, wiersz {line_number}: oczekiwano "
-                        f"{expected_sample_count} próbek, otrzymano {len(sample)}."
-                    )
-                recordings.append((label, sample))
+            if measurement < 1:
+                raise ValueError(
+                    f"{path}, wiersz {line_number}: numer pomiaru musi być dodatni."
+                )
+            if not 0 <= sample_index < SAMPLE_COUNT:
+                raise ValueError(
+                    f"{path}, wiersz {line_number}: indeks próbki musi być "
+                    f"w zakresie 0..{SAMPLE_COUNT - 1}."
+                )
+            if user_value not in (0, 1) or reference_value not in (0, 1):
+                raise ValueError(
+                    f"{path}, wiersz {line_number}: sygnały muszą zawierać "
+                    "wyłącznie wartości 0 lub 1."
+                )
+            if sample_index in recordings[measurement]:
+                raise ValueError(
+                    f"{path}, wiersz {line_number}: powtórzony indeks "
+                    f"{sample_index} w pomiarze {measurement}."
+                )
+
+            recordings[measurement][sample_index] = (user_value, reference_value)
 
     if not recordings:
-        raise ValueError("Pliki pomiarowe nie zawierają żadnych próbek.")
-    if not any(label == 1 for label, _ in recordings):
-        raise ValueError("Nie znaleziono nagrań Igora do etykietowania.")
-    if not any(label == 0 for label, _ in recordings):
-        raise ValueError("Nie znaleziono nagrań pozostałych osób.")
+        raise ValueError(f"{path} nie zawiera żadnych pomiarów.")
 
-    print(f"Pominięto nieprawidłowych próbek: {invalid_count}")
-    return recordings
-
-
-def write_raw_dataset(recordings: list[tuple[int, list[int]]]) -> Path:
-    output_path = SCRIPT_DIR / "dataset.csv"
-    sample_count = len(recordings[0][1])
-    with output_path.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.writer(output)
-        writer.writerow(
-            ["label", *[f"sample_{index:03}" for index in range(sample_count)]]
-        )
-        for label, sample in recordings:
-            writer.writerow([label, *sample])
-    return output_path
-
-
-def write_feature_dataset(recordings: list[tuple[int, list[int]]]) -> Path:
-    output_path = SCRIPT_DIR / "datasetF.csv"
-    extracted = [
-        (label, extract_features(sample, SAMPLE_PERIOD_MS))
-        for label, sample in recordings
-    ]
-
-    columns = list(dict.fromkeys(
-        column
-        for _, features in extracted
-        for column in features
-    ))
-    with output_path.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=["label", *columns])
-        writer.writeheader()
-        for label, features in extracted:
-            writer.writerow(
-                {"label": label, **{column: features.get(column) for column in columns}}
+    result = []
+    for measurement, samples in sorted(recordings.items()):
+        if len(samples) != SAMPLE_COUNT:
+            raise ValueError(
+                f"Pomiar {measurement} zawiera {len(samples)} próbek; "
+                f"oczekiwano {SAMPLE_COUNT}."
             )
-    return output_path
+        if set(samples) != set(range(SAMPLE_COUNT)):
+            raise ValueError(
+                f"Pomiar {measurement} nie zawiera wszystkich indeksów "
+                f"0..{SAMPLE_COUNT - 1}."
+            )
+
+        user_signal = [samples[index][0] for index in range(SAMPLE_COUNT)]
+        reference_signal = [samples[index][1] for index in range(SAMPLE_COUNT)]
+        result.append((user_signal, reference_signal))
+
+    return result
+
+
+def write_dataset(
+    recordings: list[tuple[list[int], list[int]]], path: Path
+) -> None:
+    sample_columns = [
+        f"user_sample_{index:03}" for index in range(SAMPLE_COUNT)
+    ] + [f"reference_sample_{index:03}" for index in range(SAMPLE_COUNT)]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as destination:
+        writer = csv.writer(destination)
+        writer.writerow(["label", *sample_columns])
+        for user_signal, reference_signal in recordings:
+            writer.writerow([1, *user_signal, *reference_signal])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Buduje surowy dataset.csv i/lub cechowy datasetF.csv."
+        description=(
+            "Tworzy dataset.csv z własnych pomiarów, zachowując osobno "
+            "sygnał użytkownika i sygnał referencyjny."
+        )
     )
     parser.add_argument(
-        "--mode",
-        choices=("raw", "features", "both"),
-        default="both",
-        help="który dataset utworzyć (domyślnie: oba)",
+        "input",
+        nargs="?",
+        type=Path,
+        default=DEFAULT_INPUT,
+        help=f"wejściowy CSV (domyślnie: {DEFAULT_INPUT})",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help=f"wyjściowy CSV (domyślnie: {DEFAULT_OUTPUT})",
     )
     args = parser.parse_args()
 
-    recordings = load_recordings()
-    if args.mode in ("raw", "both"):
-        print(f"Zapisano {len(recordings)} pomiarów do {write_raw_dataset(recordings)}")
-    if args.mode in ("features", "both"):
-        print(
-            f"Zapisano {len(recordings)} pomiarów do "
-            f"{write_feature_dataset(recordings)}"
-        )
+    if args.input.resolve() == args.output.resolve():
+        parser.error("plik wyjściowy nie może być tym samym plikiem co wejściowy")
+
+    recordings = load_recordings(args.input)
+    write_dataset(recordings, args.output)
+    print(
+        f"Zapisano {len(recordings)} pomiarów "
+        f"({SAMPLE_COUNT} próbek na sygnał) do {args.output}."
+    )
 
 
 if __name__ == "__main__":

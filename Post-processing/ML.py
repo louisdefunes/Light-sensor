@@ -1,190 +1,270 @@
+import argparse
 import csv
 import re
 from pathlib import Path
+from typing import Any
 
+import joblib
 import numpy as np
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import OneClassSVM, SVC
+from sklearn.svm import OneClassSVM
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATASETS = (
-    ("surowy", SCRIPT_DIR / "dataset.csv"),
-    ("cechy", SCRIPT_DIR / "datasetF.csv"),
+DEFAULT_DATASET = SCRIPT_DIR / "dataset.csv"
+DEFAULT_MODEL = SCRIPT_DIR / "one_class_svm.joblib"
+SAMPLE_PERIOD_MS = 10.0
+MAX_RESPONSE_DELAY_MS = 2000.0
+SAMPLE_COLUMN = re.compile(r"^(user|reference)_sample_(\d+)$")
+FEATURE_NAMES = (
+    "best_agreement",
+    "best_response_delay_ms",
+    "response_polarity",
+    "ones_ratio_error",
+    "transition_ratio",
 )
-TRANSITION_COLUMN = re.compile(r"^transition_(\d+)_ms$")
-FEATURE_TRANSITION_LIMIT = 8
-TEST_SIZE = 0.25
-RANDOM_STATE = 11
 
 
-def load_dataset(path: Path, dataset_type: str) -> tuple[np.ndarray, np.ndarray]:
-    with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
-        reader = csv.DictReader(csv_file)
+def load_recordings(path: Path) -> list[tuple[list[int], list[int]]]:
+    with path.open("r", newline="", encoding="utf-8-sig") as source:
+        reader = csv.DictReader(source)
         if not reader.fieldnames or "label" not in reader.fieldnames:
             raise ValueError(f"{path} musi zawierać kolumnę 'label'.")
 
-        if dataset_type == "surowy":
-            feature_columns = [
-                column
-                for column in reader.fieldnames
-                if column.startswith("sample_")
-            ]
-        else:
-            transition_columns = sorted(
-                (
-                    column
-                    for column in reader.fieldnames
-                    if TRANSITION_COLUMN.match(column)
-                ),
-                key=lambda column: int(TRANSITION_COLUMN.match(column).group(1)),
+        columns: dict[str, list[tuple[int, str]]] = {
+            "user": [],
+            "reference": [],
+        }
+        for column in reader.fieldnames:
+            match = SAMPLE_COLUMN.fullmatch(column)
+            if match:
+                signal_name, index_text = match.groups()
+                columns[signal_name].append((int(index_text), column))
+
+        for signal_name in columns:
+            columns[signal_name].sort()
+        if not columns["user"] or len(columns["user"]) != len(columns["reference"]):
+            raise ValueError(
+                f"{path} musi zawierać jednakową liczbę kolumn "
+                "'user_sample_NNN' i 'reference_sample_NNN'."
             )
-            feature_columns = [
-                "transition_count",
-                *transition_columns[:FEATURE_TRANSITION_LIMIT],
-            ]
-            feature_columns = [
-                column for column in feature_columns if column in reader.fieldnames
-            ]
+        if [index for index, _ in columns["user"]] != list(
+            range(len(columns["user"]))
+        ) or [index for index, _ in columns["reference"]] != list(
+            range(len(columns["reference"]))
+        ):
+            raise ValueError(f"{path} musi mieć ciągłe indeksy próbek od zera.")
 
         rows = list(reader)
 
-    if not rows or not feature_columns:
-        raise ValueError(f"{path} nie zawiera pomiarów ani odpowiednich cech.")
+    if not rows:
+        raise ValueError(f"{path} nie zawiera pomiarów.")
 
-    valid_rows = []
-    invalid_count = 0
-    try:
-        for row in rows:
-            values = [
-                float(row[column]) if row[column].strip() else np.nan
-                for column in feature_columns
+    recordings = []
+    for row_number, row in enumerate(rows, start=2):
+        try:
+            label = int(row["label"])
+            user_signal = [int(row[column]) for _, column in columns["user"]]
+            reference_signal = [
+                int(row[column]) for _, column in columns["reference"]
             ]
-            transition_count = (
-                float(row["transition_count"])
-                if "transition_count" in row and row["transition_count"].strip()
-                else None
+        except (TypeError, ValueError, KeyError) as error:
+            raise ValueError(
+                f"{path}, wiersz {row_number}: nieprawidłowa etykieta lub próbka."
+            ) from error
+
+        if label != 1:
+            raise ValueError(
+                f"{path}, wiersz {row_number}: OneClassSVM w tym skrypcie "
+                "uczy się wyłącznie na własnych pomiarach z etykietą 1."
             )
-            if transition_count is None and dataset_type == "surowy":
-                transition_count = sum(
-                    current != previous for previous, current in zip(values, values[1:])
-                )
-            elif transition_count is None:
-                transition_count = sum(
-                    not np.isnan(value)
-                    for column, value in zip(feature_columns, values)
-                    if TRANSITION_COLUMN.match(column)
-                )
-            if transition_count == 0:
-                invalid_count += 1
-                continue
-            valid_rows.append((int(row["label"]), values))
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{path} zawiera nieprawidłowe etykiety lub cechy.") from error
+        if any(value not in (0, 1) for value in user_signal + reference_signal):
+            raise ValueError(
+                f"{path}, wiersz {row_number}: sygnały muszą zawierać "
+                "wyłącznie wartości 0 lub 1."
+            )
+        recordings.append((user_signal, reference_signal))
 
-    if invalid_count:
-        print(f"  Odrzucono {invalid_count} próbek bez zmian stanu.")
-    if not valid_rows:
-        raise ValueError(f"{path} nie zawiera prawidłowych próbek.")
-
-    labels = np.array([label for label, _ in valid_rows], dtype=int)
-    features = np.array([values for _, values in valid_rows], dtype=float)
-
-    if not np.isin(labels, (0, 1)).all():
-        raise ValueError(f"{path}: etykiety muszą być binarne (1=Igor, 0=inni).")
-    if np.isinf(features).any():
-        raise ValueError(f"{path} zawiera nieskończone wartości cech.")
-
-    return features, labels
+    return recordings
 
 
-def print_metrics(
-    model_name: str,
-    predictions: np.ndarray,
-    labels: np.ndarray,
-    accepted_label: int,
-) -> None:
-    genuine = labels == 1
-    impostors = labels == 0
-    false_rejections = int(np.count_nonzero(predictions[genuine] != accepted_label))
-    false_acceptances = int(np.count_nonzero(predictions[impostors] == accepted_label))
+def extract_response_features(
+    user_signal: list[int],
+    reference_signal: list[int],
+    max_response_delay_ms: float = MAX_RESPONSE_DELAY_MS,
+) -> list[float]:
+    if len(user_signal) != len(reference_signal) or not user_signal:
+        raise ValueError("Sygnały muszą być niepuste i mieć jednakową długość.")
+    if any(value not in (0, 1) for value in user_signal + reference_signal):
+        raise ValueError("Sygnały muszą zawierać wyłącznie wartości 0 lub 1.")
 
-    frr = false_rejections / np.count_nonzero(genuine)
-    far = false_acceptances / np.count_nonzero(impostors)
-    print(
-        f"  {model_name}: "
-        f"FRR {false_rejections}/{np.count_nonzero(genuine)} = {frr:.1%}; "
-        f"FAR {false_acceptances}/{np.count_nonzero(impostors)} = {far:.1%}"
+    max_lag = min(
+        int(max_response_delay_ms / SAMPLE_PERIOD_MS),
+        len(user_signal) - 1,
+    )
+    best_agreement = -1.0
+    best_lag = 0
+    best_polarity = 1
+
+    for polarity in (1, -1):
+        for lag in range(max_lag + 1):
+            reference_aligned = reference_signal[: len(reference_signal) - lag or None]
+            user_aligned = user_signal[lag:]
+            matches = sum(
+                user == (reference if polarity == 1 else 1 - reference)
+                for user, reference in zip(user_aligned, reference_aligned)
+            )
+            agreement = matches / len(user_aligned)
+            if agreement > best_agreement:
+                best_agreement = agreement
+                best_lag = lag
+                best_polarity = polarity
+
+    user_transitions = sum(
+        previous != current
+        for previous, current in zip(user_signal, user_signal[1:])
+    )
+    reference_transitions = sum(
+        previous != current
+        for previous, current in zip(reference_signal, reference_signal[1:])
+    )
+    expected_ones_ratio = sum(reference_signal) / len(reference_signal)
+    if best_polarity == -1:
+        expected_ones_ratio = 1.0 - expected_ones_ratio
+
+    return [
+        best_agreement,
+        best_lag * SAMPLE_PERIOD_MS,
+        float(best_polarity),
+        sum(user_signal) / len(user_signal) - expected_ones_ratio,
+        user_transitions / max(reference_transitions, 1),
+    ]
+
+
+def make_feature_matrix(
+    recordings: list[tuple[list[int], list[int]]],
+    max_response_delay_ms: float = MAX_RESPONSE_DELAY_MS,
+) -> np.ndarray:
+    return np.asarray(
+        [
+            extract_response_features(user, reference, max_response_delay_ms)
+            for user, reference in recordings
+        ],
+        dtype=float,
     )
 
 
-def evaluate_dataset(
-    dataset_name: str,
+def train_model(
     dataset_path: Path,
-    test_size: float,
-    random_state: int,
+    model_path: Path,
+    nu: float,
+    max_response_delay_ms: float,
 ) -> None:
-    features, labels = load_dataset(dataset_path, dataset_name)
-    if np.count_nonzero(labels == 1) < 2 or np.count_nonzero(labels == 0) < 2:
-        raise ValueError(f"{dataset_path}: potrzeba co najmniej 2 próbek każdej klasy.")
+    recordings = load_recordings(dataset_path)
+    features = make_feature_matrix(recordings, max_response_delay_ms)
 
-    x_train, x_test, y_train, y_test = train_test_split(
-        features,
-        labels,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=labels,
-    )
-
-    svc = make_pipeline(
-        SimpleImputer(strategy="median"),
+    estimator = make_pipeline(
         StandardScaler(),
-        SVC(class_weight="balanced"),
+        OneClassSVM(kernel="rbf", nu=nu, gamma="scale"),
     )
-    svc.fit(x_train, y_train)
-    svc_predictions = svc.predict(x_test)
+    estimator.fit(features)
+    training_predictions = estimator.predict(features)
 
-    genuine_train = x_train[y_train == 1]
-    one_class_svm = make_pipeline(
-        SimpleImputer(strategy="median"),
-        StandardScaler(),
-        OneClassSVM(kernel="rbf", nu=0.1, gamma="scale"),
-    )
-    one_class_svm.fit(genuine_train)
-    one_class_predictions = one_class_svm.predict(x_test)
+    model_bundle: dict[str, Any] = {
+        "estimator": estimator,
+        "feature_names": FEATURE_NAMES,
+        "sample_period_ms": SAMPLE_PERIOD_MS,
+        "max_response_delay_ms": max_response_delay_ms,
+        "nu": nu,
+        "training_sample_count": len(recordings),
+    }
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model_bundle, model_path)
 
-    train_igor_count = int(np.count_nonzero(y_train == 1))
-    train_other_count = int(np.count_nonzero(y_train == 0))
-    test_igor_count = int(np.count_nonzero(y_test == 1))
-    test_other_count = int(np.count_nonzero(y_test == 0))
+    rejected = int(np.count_nonzero(training_predictions == -1))
+    print(f"Wytrenowano OneClassSVM na {len(recordings)} własnych pomiarach.")
+    print(f"Liczba cech odpowiedzi: {features.shape[1]} ({', '.join(FEATURE_NAMES)}).")
     print(
-        f"\n{dataset_name} ({dataset_path.name}), {features.shape[1]} cech\n"
-        f"  Podział: trening {len(x_train)} "
-        f"(Igor {train_igor_count}, inni {train_other_count}); "
-        f"test {len(x_test)} "
-        f"(Igor {test_igor_count}, inni {test_other_count})\n"
-        f"  SVC uczy się na: {len(x_train)} próbkach "
-        f"(Igor {train_igor_count}, inni {train_other_count})\n"
-        f"  OneClassSVM uczy się na: {len(genuine_train)} próbkach Igora"
+        f"Próbki treningowe oznaczone jako odstające: "
+        f"{rejected}/{len(recordings)}."
     )
-    print_metrics("SVC", svc_predictions, y_test, accepted_label=1)
-    print_metrics("OneClassSVM", one_class_predictions, y_test, accepted_label=1)
+    print(f"Model zapisano do: {model_path}")
+    print("Ocena na danych treningowych nie jest miarą skuteczności na nowych osobach.")
+
+
+def load_model(model_path: Path = DEFAULT_MODEL) -> dict[str, Any]:
+    model_bundle = joblib.load(model_path)
+    if not isinstance(model_bundle, dict) or "estimator" not in model_bundle:
+        raise ValueError(f"{model_path} nie zawiera obsługiwanego modelu.")
+    return model_bundle
+
+
+def predict_measurement(
+    model_bundle: dict[str, Any],
+    user_signal: list[int],
+    reference_signal: list[int],
+) -> tuple[bool, float]:
+    features = extract_response_features(
+        user_signal,
+        reference_signal,
+        model_bundle["max_response_delay_ms"],
+    )
+    feature_row = np.asarray([features], dtype=float)
+    prediction = int(model_bundle["estimator"].predict(feature_row)[0])
+    score = float(model_bundle["estimator"].decision_function(feature_row)[0])
+    return prediction == 1, score
 
 
 def main() -> None:
-    for dataset_type, dataset_path in DATASETS:
-        if not dataset_path.is_file():
-            print(f"Pominięto {dataset_path.name}: plik nie istnieje.")
-            continue
-        evaluate_dataset(
-            dataset_type,
-            dataset_path,
-            test_size=TEST_SIZE,
-            random_state=RANDOM_STATE,
+    parser = argparse.ArgumentParser(
+        description=(
+            "Trenuje OneClassSVM na własnych, sparowanych sygnałach "
+            "użytkownika i referencyjnych; zapisuje model joblib."
         )
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=DEFAULT_DATASET,
+        help=f"wejściowy dataset (domyślnie: {DEFAULT_DATASET})",
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL,
+        help=f"plik modelu joblib (domyślnie: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--nu",
+        type=float,
+        default=0.1,
+        help="górne oszacowanie udziału odstających próbek treningowych (domyślnie: 0.1)",
+    )
+    parser.add_argument(
+        "--max-response-delay-ms",
+        type=float,
+        default=MAX_RESPONSE_DELAY_MS,
+        help=(
+            "maksymalne opóźnienie odpowiedzi uwzględniane przy dopasowaniu "
+            f"(domyślnie: {MAX_RESPONSE_DELAY_MS:g} ms)"
+        ),
+    )
+    args = parser.parse_args()
+
+    if not 0 < args.nu <= 1:
+        parser.error("--nu musi należeć do przedziału (0, 1]")
+    if args.max_response_delay_ms < 0:
+        parser.error("--max-response-delay-ms nie może być ujemne")
+    if args.dataset.resolve() == args.model.resolve():
+        parser.error("plik modelu nie może być tym samym plikiem co dataset")
+
+    train_model(
+        args.dataset,
+        args.model,
+        args.nu,
+        args.max_response_delay_ms,
+    )
 
 
 if __name__ == "__main__":
