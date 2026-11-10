@@ -13,6 +13,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_system.h"
+#include "esp_random.h"
 
 // #define __DBG__
 // #define __DBG_UART__
@@ -43,6 +44,10 @@
 #define HYSTERESIS_VAL 200
 #define BASELINE_SAMPLE_COUNT 100
 
+#define SAMPLE_ACQUISITON_TIME 10000 // 10k ms = 10s
+#define MAX_RAND_SAMPLES 200
+#define MIN_RAND_SAMPLES 40
+
 #if defined(__DBG__) || defined(__DBG_UART__)
     #define SAMPLES_COLLECTED 1000
     static const char *TAG = "ADC Sensor Module";
@@ -50,14 +55,53 @@
     #define SAMPLES_COLLECTED 1000
 #endif
 
-#define ASSERT(val, action) if(!(val)) {action; return;}
+#define ASSERT(val, action) do { if (!(val)) { action; return; } } while (0)
 
 typedef struct {
-    uint8_t *featuresV;
+    uint8_t *userSignal;
+    uint8_t *refSignal;
+} measurement_t;
+
+typedef struct {
+    measurement_t measurement;
     adc_oneshot_unit_handle_t adcHandle;
 } uart_task_params_t;
 
-void ledFlicker_task(void *pvParameters)
+uint32_t inline random_phased_number(uint32_t max, uint32_t min) {
+    return ((esp_random() % (max - min + 1)) + min);
+}
+
+uint8_t *genRandomPattern(void) {
+    uint8_t *pattern = malloc(SAMPLES_COLLECTED);
+    if (pattern == NULL) {
+        return NULL;
+    }
+
+    uint32_t remaining = SAMPLES_COLLECTED;
+    uint8_t state = 0;
+
+    uint8_t *cursor = pattern;
+    
+    while(remaining > 0) {
+        uint32_t phase = 
+            random_phased_number(MAX_RAND_SAMPLES, MIN_RAND_SAMPLES);
+
+        if (phase > remaining) {
+            phase = remaining;
+        }
+        memset(cursor, state, phase);
+        cursor += phase;
+        remaining -= phase;
+        state = !state;
+    }
+    return pattern;
+}
+
+static void acquire_measurement(
+    measurement_t *measurement,
+    adc_oneshot_unit_handle_t adcHandle,
+    uint32_t thrUpp,
+    uint32_t thrLow)
 {
     gpio_reset_pin(LED_GPIO_BLINK);
     gpio_set_direction(LED_GPIO_BLINK, GPIO_MODE_OUTPUT);
@@ -66,64 +110,75 @@ void ledFlicker_task(void *pvParameters)
     gpio_set_direction(LED_GPIO_2, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO_2, 1);
 
-    while(1) {
-        
-        gpio_set_level(LED_GPIO_BLINK, 0); // Wyłącz
-        vTaskDelay(pdMS_TO_TICKS(2000));
+    uint32_t current_state = 0;
+    TickType_t nextSampleTime = xTaskGetTickCount();
 
-        gpio_set_level(LED_GPIO_BLINK, 1); // Włącz
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        
-        gpio_set_level(LED_GPIO_BLINK, 0); // Włącz
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        
-        gpio_set_level(LED_GPIO_BLINK, 1); // Wyłącz
-        vTaskDelay(pdMS_TO_TICKS(500));
-        
-        gpio_set_level(LED_GPIO_BLINK, 0); // Włącz
-        vTaskDelay(pdMS_TO_TICKS(500));
-        
-        gpio_set_level(LED_GPIO_BLINK, 1); // Wyłącz
-        vTaskDelay(pdMS_TO_TICKS(500));
-        
-        gpio_set_level(LED_GPIO_BLINK, 0); // Włącz
-        vTaskDelay(pdMS_TO_TICKS(500));
-        
-        gpio_set_level(LED_GPIO_BLINK, 1); // Wyłącz
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    for (uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
+        gpio_set_level(LED_GPIO_BLINK, measurement->refSignal[i]);
+
+        int raw;
+        ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, ADC_CHANNEL, &raw));
+
+#ifdef __DBG__
+        printf("Raw data: %-4d, Current State: %lu  \n\033[A",
+               raw, (unsigned long)current_state);
+        fflush(stdout);
+#endif
+
+        if ((uint32_t)raw >= thrUpp) {
+            current_state = 1;
+        } else if ((uint32_t)raw <= thrLow) {
+            current_state = 0;
+        }
+
+        measurement->userSignal[i] = (uint8_t)current_state;
+        vTaskDelayUntil(&nextSampleTime, pdMS_TO_TICKS(10));
     }
+
+#ifdef __DBG__
+    printf("\nFINAL FEATURE VECTOR:\n");
+    for (uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
+        printf("%u", measurement->userSignal[i]);
+        if ((i + 1) % 50 == 0) {
+            printf("\n");
+        } else {
+            printf(" ");
+        }
+    }
+    printf("\n");
+#endif
 }
 
 void uartTask(void *pvParameters)
 {
-    uart_task_params_t *params = (uart_task_params_t *)pvParameters;
-
-    if (params == NULL) {
-        vTaskDelete(NULL);
-        return;
-    }
+    uart_task_params_t *params = pvParameters;
+    ASSERT(params, vTaskDelete(NULL));
 
     uartConfig();
 
     uint8_t start = 0xAA;
     uint8_t end = 0xBB;
-    int retSum = 0;
+    uint32_t retSum = 0;
 
     // send START signal
     int ret = uart_write_bytes(UART_NUM_0, &start, sizeof(uint8_t));
     ASSERT(ret, vTaskDelete(NULL));
     
 #ifdef __DBG_UART__
-for(int i = 0; i < SAMPLES_COLLECTED; i++) {
+for(uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
     static uint8_t test = 0x43; //0x43 = 67
     ret = uart_write_bytes(UART_NUM_0, &test, sizeof(uint8_t));
     ASSERT(ret, vTaskDelete(NULL));
     retSum += ret;
     }
 #else
-    // send DATA
-    ret = uart_write_bytes(UART_NUM_0, params->featuresV, SAMPLES_COLLECTED);
-    ASSERT(ret, vTaskDelete(NULL));
+    // send USER DATA
+    ret = uart_write_bytes(UART_NUM_0, params->measurement.userSignal, SAMPLES_COLLECTED);
+    ASSERT(ret == SAMPLES_COLLECTED, vTaskDelete(NULL));
+
+    // send REFERENCE DATA
+    ret = uart_write_bytes(UART_NUM_0, params->measurement.refSignal, SAMPLES_COLLECTED);
+    ASSERT(ret == SAMPLES_COLLECTED, vTaskDelete(NULL));
 #endif
 
     // send END signal
@@ -134,7 +189,8 @@ for(int i = 0; i < SAMPLES_COLLECTED; i++) {
         adc_oneshot_del_unit(params->adcHandle);
     }
 
-    free(params->featuresV);
+    free(params->measurement.userSignal);
+    free(params->measurement.refSignal);
     free(params);
 
 #ifdef __DBG_UART__
@@ -151,11 +207,12 @@ for(int i = 0; i < SAMPLES_COLLECTED; i++) {
 
 void app_main(void)
 {
-    //  Create flickering task for the user 
-    //  to repeatedly place the finger on the photoresistor
-    if (xTaskCreate(ledFlicker_task, "led", 2048, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE("LED", "Nie udalo sie utworzyc taska LED");
-    } 
+    measurement_t *measurement = malloc(sizeof(measurement_t));
+    ASSERT(measurement, );
+
+    measurement->userSignal = malloc(SAMPLES_COLLECTED * sizeof(uint8_t));
+    measurement->refSignal = genRandomPattern();
+
     vTaskDelay(pdMS_TO_TICKS(DELAY_MS));
     esp_log_level_set("*", ESP_LOG_NONE);
     //  Setup handle for ADC Continuous mode
@@ -179,8 +236,8 @@ void app_main(void)
 #endif
 
     //  Set threshold baseline by acquiring 50 raw_data reads and computing the mean
-    int baseline = 0;
-    for (int i = 0; i < BASELINE_SAMPLE_COUNT; i++) {
+    uint32_t baseline = 0;
+    for (uint32_t i = 0; i < BASELINE_SAMPLE_COUNT; i++) {
         int raw;
         ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, ADC_CHANNEL, &raw));
         baseline += raw;
@@ -188,60 +245,37 @@ void app_main(void)
     baseline /= BASELINE_SAMPLE_COUNT;
 
     //  final thresholds, hysteresis value added to thrLow found experimentally
-    int thrUpp = baseline + HYSTERESIS_VAL;
-    int thrLow = baseline + (HYSTERESIS_VAL * 0.7);
+    uint32_t thrUpp = baseline + HYSTERESIS_VAL;
+    uint32_t thrLow = baseline + (HYSTERESIS_VAL * 0.7);
 #ifdef __DBG__
     printf("UPPER THRESHOLD: %d\n", thrUpp);
     printf("LOWER THRESHOLD: %d\n", thrLow);
 #endif
     vTaskDelay(pdMS_TO_TICKS(DELAY_MS));
 
-    uint8_t *featuresV = malloc(SAMPLES_COLLECTED * sizeof(uint8_t));
-    //  0x03 = 3 - it should be anything other than 0 and 1
-    //  it cannot be 0 nor 1 because they represent actual values while 3 is
-    //  easily distinguishable from other read values
-    memset(featuresV, 0x03, SAMPLES_COLLECTED);
+    memset(measurement->userSignal, 0x03, SAMPLES_COLLECTED);
 
-    // current state assuming the sensor starts from being unobscured
-    int current_state = 0;
-    for (int i = 0; i < SAMPLES_COLLECTED; i++) {
-        int raw;
-        ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, ADC_CHANNEL, &raw));
-
-#ifdef __DBG__
-        printf("Raw data: %-4u, Current State: %d  \n\033[A", raw, current_state);
-        fflush(stdout);
-#endif
-
-        if (raw >= thrUpp) {
-            current_state = 1;
-        } else if (raw <= thrLow) { 
-            current_state = 0;
-        }
-
-        featuresV[i] = (uint8_t)current_state;
-        vTaskDelay(pdMS_TO_TICKS(10)); 
-    }
-
-#ifdef __DBG__
-    printf("\nFINAL FEATURE VECTOR:\n");
-    for (int i = 0; i < SAMPLES_COLLECTED; i++) {
-        printf("%u", featuresV[i]);
-        if ((i + 1) % 50 == 0) {
-            printf("\n");
-        } else {
-            printf(" ");
-        }
-    }
-    printf("\n");
-#endif
+    acquire_measurement(measurement, adcHandle, thrUpp, thrLow);
 
 #ifndef __DBG__
     uart_task_params_t *uartParams = malloc(sizeof(uart_task_params_t));
     if (uartParams != NULL) {
-        uartParams->featuresV = featuresV;
+        uartParams->measurement = *measurement;
         uartParams->adcHandle = adcHandle;
-        xTaskCreate(&uartTask, "uartSend", 4096, uartParams, 5, NULL);
+         if (xTaskCreate(&uartTask, 
+                        "uartSend", 
+                        4096, 
+                        uartParams, 
+                        5,
+                        NULL) == pdPASS) {
+            free(measurement);
+         } else {
+            free(uartParams);
+            free(measurement->userSignal);
+            free(measurement->refSignal);
+            adc_oneshot_del_unit(adcHandle);
+            free(measurement);
+         }
     }
 #endif
 }
