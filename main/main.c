@@ -15,7 +15,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 
-// #define __DBG__
+#define __DBG__
 // #define __DBG_UART__
 
 //  LED config
@@ -248,8 +248,8 @@ void app_main(void)
     uint32_t thrUpp = baseline + HYSTERESIS_VAL;
     uint32_t thrLow = baseline + (HYSTERESIS_VAL * 0.7);
 #ifdef __DBG__
-    printf("UPPER THRESHOLD: %d\n", thrUpp);
-    printf("LOWER THRESHOLD: %d\n", thrLow);
+    printf("UPPER THRESHOLD: %ld\n", thrUpp);
+    printf("LOWER THRESHOLD: %ld\n", thrLow);
 #endif
     vTaskDelay(pdMS_TO_TICKS(DELAY_MS));
 
