@@ -204,6 +204,10 @@ for(int i = 0; i < SAMPLES_COLLECTED; i++) {
 
 void app_main(void)
 {
+    gpio_reset_pin(LED_GPIO_BLINK);
+    gpio_set_direction(LED_GPIO_BLINK, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO_BLINK, 0);
+
     gpio_reset_pin(LED_GPIO_2);
     gpio_set_direction(LED_GPIO_2, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO_2, 1);

@@ -100,23 +100,33 @@ def save_measurements(measurements):
     print(f"Zapisano dane do pliku {CSV_FILENAME}.")
 
 
+def summarize_signal(signal):
+    mean = sum(signal) / len(signal)
+    variance = sum((value - mean) ** 2 for value in signal) / len(signal)
+    transitions = sum(
+        previous != current
+        for previous, current in zip(signal, signal[1:])
+    )
+    return mean, variance**0.5, transitions
+
+
 def plot_measurements(measurements):
     time_axis = [
         sample_index * SAMPLE_INTERVAL_SECONDS
         for sample_index in range(SAMPLE_COUNT)
     ]
     figure, axes = plt.subplots(
-        len(measurements),
+        len(measurements) * 2,
         1,
-        figsize=(12, max(4, 3 * len(measurements))),
+        figsize=(12, max(5, 4.5 * len(measurements))),
+        gridspec_kw={"height_ratios": [4, 1] * len(measurements)},
         sharex=True,
-        sharey=True,
         squeeze=False,
     )
 
-    for measurement_number, ((user_signal, reference_signal), axis) in enumerate(
-        zip(measurements, axes[:, 0]), start=1
-    ):
+    for measurement_index, (user_signal, reference_signal) in enumerate(measurements):
+        axis = axes[measurement_index * 2, 0]
+        stats_axis = axes[measurement_index * 2 + 1, 0]
         axis.step(
             time_axis,
             user_signal,
@@ -130,16 +140,39 @@ def plot_measurements(measurements):
             label="Sygnał referencyjny",
             alpha=0.8,
         )
-        axis.set_title(f"Pomiar {measurement_number}")
+        axis.set_title(f"Pomiar {measurement_index + 1}")
         axis.set_ylabel("Stan")
         axis.set_yticks([0, 1])
         axis.set_ylim(-0.1, 1.1)
         axis.grid(True)
         axis.legend(loc="upper right")
 
-    axes[-1, 0].set_xlabel("Czas [s]")
+        user_mean, user_std, user_transitions = summarize_signal(user_signal)
+        ref_mean, ref_std, ref_transitions = summarize_signal(reference_signal)
+        agreement = sum(
+            user == reference
+            for user, reference in zip(user_signal, reference_signal)
+        ) / len(user_signal)
+        stats_axis.axis("off")
+        stats_axis.text(
+            0.01,
+            0.95,
+            (
+                f"Użytkownik: stan 1 = {user_mean:.1%}, "
+                f"odch. std. = {user_std:.3f}, "
+                f"przejścia = {user_transitions}\n"
+                f"Referencja: stan 1 = {ref_mean:.1%}, "
+                f"odch. std. = {ref_std:.3f}, "
+                f"przejścia = {ref_transitions}\n"
+                f"Zgodność próbek: {agreement:.1%}"
+            ),
+            va="top",
+            transform=stats_axis.transAxes,
+        )
+
+    axes[-2, 0].set_xlabel("Czas [s]")
     figure.suptitle("Porównanie sygnału użytkownika z wzorcem")
-    figure.tight_layout()
+    figure.tight_layout(rect=(0, 0, 1, 0.97))
     plt.show()
 
 
