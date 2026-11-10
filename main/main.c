@@ -15,7 +15,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 
-#define __DBG__
+// #define __DBG__
 // #define __DBG_UART__
 
 //  LED config
@@ -45,7 +45,7 @@
 #define BASELINE_SAMPLE_COUNT 100
 
 #define SAMPLE_ACQUISITON_TIME 10000 // 10k ms = 10s
-#define MAX_RAND_SAMPLES 200
+#define MAX_RAND_SAMPLES 100
 #define MIN_RAND_SAMPLES 40
 
 #if defined(__DBG__) || defined(__DBG_UART__)
@@ -67,7 +67,7 @@ typedef struct {
     adc_oneshot_unit_handle_t adcHandle;
 } uart_task_params_t;
 
-uint32_t inline random_phased_number(uint32_t max, uint32_t min) {
+int inline random_phased_number(int max, int min) {
     return ((esp_random() % (max - min + 1)) + min);
 }
 
@@ -77,13 +77,13 @@ uint8_t *genRandomPattern(void) {
         return NULL;
     }
 
-    uint32_t remaining = SAMPLES_COLLECTED;
+    int remaining = SAMPLES_COLLECTED;
     uint8_t state = 0;
 
     uint8_t *cursor = pattern;
     
     while(remaining > 0) {
-        uint32_t phase = 
+        int phase = 
             random_phased_number(MAX_RAND_SAMPLES, MIN_RAND_SAMPLES);
 
         if (phase > remaining) {
@@ -100,20 +100,17 @@ uint8_t *genRandomPattern(void) {
 static void acquire_measurement(
     measurement_t *measurement,
     adc_oneshot_unit_handle_t adcHandle,
-    uint32_t thrUpp,
-    uint32_t thrLow)
+    int thrUpp,
+    int thrLow)
 {
     gpio_reset_pin(LED_GPIO_BLINK);
     gpio_set_direction(LED_GPIO_BLINK, GPIO_MODE_OUTPUT);
 
-    gpio_reset_pin(LED_GPIO_2);
-    gpio_set_direction(LED_GPIO_2, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO_2, 1);
 
-    uint32_t current_state = 0;
+    int current_state = 0;
     TickType_t nextSampleTime = xTaskGetTickCount();
 
-    for (uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
+    for (int i = 0; i < SAMPLES_COLLECTED; i++) {
         gpio_set_level(LED_GPIO_BLINK, measurement->refSignal[i]);
 
         int raw;
@@ -125,9 +122,9 @@ static void acquire_measurement(
         fflush(stdout);
 #endif
 
-        if ((uint32_t)raw >= thrUpp) {
+        if (raw >= thrUpp) {
             current_state = 1;
-        } else if ((uint32_t)raw <= thrLow) {
+        } else if (raw <= thrLow) {
             current_state = 0;
         }
 
@@ -137,7 +134,7 @@ static void acquire_measurement(
 
 #ifdef __DBG__
     printf("\nFINAL FEATURE VECTOR:\n");
-    for (uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
+    for (int i = 0; i < SAMPLES_COLLECTED; i++) {
         printf("%u", measurement->userSignal[i]);
         if ((i + 1) % 50 == 0) {
             printf("\n");
@@ -158,14 +155,14 @@ void uartTask(void *pvParameters)
 
     uint8_t start = 0xAA;
     uint8_t end = 0xBB;
-    uint32_t retSum = 0;
+    int retSum = 0;
 
     // send START signal
     int ret = uart_write_bytes(UART_NUM_0, &start, sizeof(uint8_t));
     ASSERT(ret, vTaskDelete(NULL));
     
 #ifdef __DBG_UART__
-for(uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
+for(int i = 0; i < SAMPLES_COLLECTED; i++) {
     static uint8_t test = 0x43; //0x43 = 67
     ret = uart_write_bytes(UART_NUM_0, &test, sizeof(uint8_t));
     ASSERT(ret, vTaskDelete(NULL));
@@ -207,6 +204,11 @@ for(uint32_t i = 0; i < SAMPLES_COLLECTED; i++) {
 
 void app_main(void)
 {
+    gpio_reset_pin(LED_GPIO_2);
+    gpio_set_direction(LED_GPIO_2, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO_2, 1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
     measurement_t *measurement = malloc(sizeof(measurement_t));
     ASSERT(measurement, );
 
@@ -235,21 +237,25 @@ void app_main(void)
     ESP_LOGI(TAG, "configured succesfully");
 #endif
 
+
     //  Set threshold baseline by acquiring 50 raw_data reads and computing the mean
-    uint32_t baseline = 0;
-    for (uint32_t i = 0; i < BASELINE_SAMPLE_COUNT; i++) {
+    int baseline = 0;
+    for (int i = 0; i < BASELINE_SAMPLE_COUNT; i++) {
         int raw;
         ESP_ERROR_CHECK(adc_oneshot_read(adcHandle, ADC_CHANNEL, &raw));
         baseline += raw;
+#ifdef __DBG__
+        printf("raw: %d\n", raw);
+#endif
     }
     baseline /= BASELINE_SAMPLE_COUNT;
 
     //  final thresholds, hysteresis value added to thrLow found experimentally
-    uint32_t thrUpp = baseline + HYSTERESIS_VAL;
-    uint32_t thrLow = baseline + (HYSTERESIS_VAL * 0.7);
+    int thrUpp = baseline + HYSTERESIS_VAL;
+    int thrLow = baseline + (HYSTERESIS_VAL * 0.7);
 #ifdef __DBG__
-    printf("UPPER THRESHOLD: %ld\n", thrUpp);
-    printf("LOWER THRESHOLD: %ld\n", thrLow);
+    printf("UPPER THRESHOLD: %d\n", thrUpp);
+    printf("LOWER THRESHOLD: %d\n", thrLow);
 #endif
     vTaskDelay(pdMS_TO_TICKS(DELAY_MS));
 
